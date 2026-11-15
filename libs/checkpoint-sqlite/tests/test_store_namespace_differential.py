@@ -19,6 +19,14 @@ from collections.abc import Callable, Generator
 from typing import Any
 
 import pytest
+from langgraph.store.base import (
+    GetOp,
+    InvalidNamespaceError,
+    ListNamespacesOp,
+    MatchCondition,
+    PutOp,
+    SearchOp,
+)
 from langgraph.store.memory import InMemoryStore
 
 from langgraph.store.sqlite import SqliteStore
@@ -63,6 +71,7 @@ LABELS = [
 SEEDS = range(12)
 NAMESPACES_PER_SEED = 40
 QUERIES_PER_SEED = 80
+OPERATIONS_PER_SEED = 60
 
 
 def _random_namespace(rng: random.Random) -> tuple[str, ...]:
@@ -185,3 +194,116 @@ def test_namespace_matching_agrees_with_in_memory_store(
     ]
     for namespace in absent:
         assert store.get(namespace, "k") is None, f"seed={seed}: get({namespace!r})"
+
+
+def _contents(store: Any) -> dict[tuple[tuple[str, ...], str], Any]:
+    return {
+        (tuple(item.namespace), item.key): item.value
+        for item in store.search((), limit=10000)
+    }
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_writes_stay_inside_their_namespace(store: Any, seed: int) -> None:
+    """Overwrites and deletes must only touch the namespace they address.
+
+    A near-miss label (a sibling, a different case, a pattern metacharacter) must
+    never resolve to another namespace's item, whether the write goes through
+    `put`/`delete` or through `batch`.
+    """
+    rng = random.Random(seed)
+    stored = sorted({_random_namespace(rng) for _ in range(NAMESPACES_PER_SEED)})
+    keys = ["k", "k2"]
+    expected: dict[tuple[tuple[str, ...], str], Any] = {}
+    for position, namespace in enumerate(stored):
+        for key in keys:
+            value = {"position": position, "key": key}
+            store.put(namespace, key, value, index=False, ttl=None)
+            expected[(namespace, key)] = value
+    assert _contents(store) == expected
+
+    for step in range(OPERATIONS_PER_SEED):
+        # Mostly address existing namespaces, but include near-misses of them.
+        base = rng.choice(stored)
+        if rng.random() < 0.5:
+            namespace = base
+        else:
+            namespace = (
+                (*base[:-1], rng.choice(LABELS))
+                if rng.random() < 0.5
+                else _random_namespace(rng)
+            )
+        key = rng.choice(keys)
+        via_batch = rng.random() < 0.5
+        if rng.random() < 0.5:
+            value = {"step": step}
+            if via_batch:
+                store.batch([PutOp(namespace, key, value, index=False, ttl=None)])
+            else:
+                store.put(namespace, key, value, index=False, ttl=None)
+            expected[(namespace, key)] = value
+            action = "put"
+        else:
+            if via_batch:
+                store.batch([PutOp(namespace, key, None)])
+            else:
+                store.delete(namespace, key)
+            expected.pop((namespace, key), None)
+            action = "delete"
+        assert _contents(store) == expected, (
+            f"seed={seed} step={step}: {action}({namespace!r}, {key!r})"
+            f" via {'batch' if via_batch else 'method'}"
+        )
+
+
+DOTTED = ("tenant.bob",)  # would alias ("tenant", "bob") once dot-joined
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        lambda s: s.get(DOTTED, "k"),
+        lambda s: s.put(DOTTED, "k", {"v": "overwritten"}, index=False, ttl=None),
+        lambda s: s.delete(DOTTED, "k"),
+        lambda s: s.search(DOTTED),
+        lambda s: s.list_namespaces(prefix=DOTTED),
+        lambda s: s.list_namespaces(suffix=DOTTED),
+        lambda s: s.batch([GetOp(DOTTED, "k")]),
+        lambda s: s.batch([PutOp(DOTTED, "k", {"v": "overwritten"})]),
+        lambda s: s.batch([PutOp(DOTTED, "k", None)]),
+        lambda s: s.batch([SearchOp(DOTTED)]),
+        lambda s: s.batch(
+            [ListNamespacesOp(match_conditions=(MatchCondition("prefix", DOTTED),))]
+        ),
+        lambda s: s.batch(
+            [ListNamespacesOp(match_conditions=(MatchCondition("suffix", DOTTED),))]
+        ),
+    ],
+    ids=[
+        "get",
+        "put",
+        "delete",
+        "search",
+        "list_prefix",
+        "list_suffix",
+        "batch_get",
+        "batch_put",
+        "batch_delete",
+        "batch_search",
+        "batch_list_prefix",
+        "batch_list_suffix",
+    ],
+)
+def test_dotted_label_cannot_address_another_namespace(
+    store: Any, call: Callable[[Any], Any]
+) -> None:
+    """A label containing `.` is rejected on every entry point, changing nothing.
+
+    Namespaces are stored dot-joined, so `("tenant.bob",)` would otherwise address
+    the namespace `("tenant", "bob")`.
+    """
+    store.put(("tenant", "bob"), "k", {"v": "bob"}, index=False, ttl=None)
+    before = _contents(store)
+    with pytest.raises(InvalidNamespaceError):
+        call(store)
+    assert _contents(store) == before
